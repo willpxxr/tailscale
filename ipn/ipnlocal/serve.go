@@ -644,10 +644,12 @@ func (b *LocalBackend) tcpHandlerForVIPService(dstAddr, srcAddr netip.AddrPort) 
 func (b *LocalBackend) tcpHandlerForIngressServiceDNAT(dstSvc tailcfg.ServiceName, dstAddr netip.AddrPort) func(net.Conn) error {
 	cfgPath := os.Getenv("TS_INGRESS_PROXIES_CONFIG_PATH")
 	if cfgPath == "" {
+		b.logf("tcpHandlerForIngressServiceDNAT: TS_INGRESS_PROXIES_CONFIG_PATH not set")
 		return nil
 	}
 	j, err := os.ReadFile(cfgPath)
 	if err != nil {
+		b.logf("tcpHandlerForIngressServiceDNAT: reading %s: %v", cfgPath, err)
 		return nil
 	}
 	var cfgs ingressservices.Configs
@@ -657,6 +659,7 @@ func (b *LocalBackend) tcpHandlerForIngressServiceDNAT(dstSvc tailcfg.ServiceNam
 	}
 	cfg := cfgs.GetConfig(dstSvc.String())
 	if cfg == nil {
+		b.logf("tcpHandlerForIngressServiceDNAT: no config for %s in %s (raw: %s)", dstSvc, cfgPath, string(j))
 		return nil
 	}
 	var clusterIP netip.Addr
@@ -666,8 +669,10 @@ func (b *LocalBackend) tcpHandlerForIngressServiceDNAT(dstSvc tailcfg.ServiceNam
 	case cfg.IPv6Mapping != nil && cfg.IPv6Mapping.TailscaleServiceIP == dstAddr.Addr():
 		clusterIP = cfg.IPv6Mapping.ClusterIP
 	default:
+		b.logf("tcpHandlerForIngressServiceDNAT: config for %s has no mapping matching dst %s (cfg: %+v)", dstSvc, dstAddr.Addr(), cfg)
 		return nil
 	}
+	b.logf("tcpHandlerForIngressServiceDNAT: falling back to DNAT mapping, proxying %s to %s", dstAddr, clusterIP)
 	target := netip.AddrPortFrom(clusterIP, dstAddr.Port())
 	return func(c net.Conn) error {
 		defer c.Close()
