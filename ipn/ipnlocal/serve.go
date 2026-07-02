@@ -36,6 +36,7 @@ import (
 	"github.com/pires/go-proxyproto"
 	"go4.org/mem"
 	"tailscale.com/ipn"
+	"tailscale.com/kube/ingressservices"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
 	"tailscale.com/syncs"
@@ -607,6 +608,18 @@ func (b *LocalBackend) tcpHandlerForVIPService(dstAddr, srcAddr netip.AddrPort) 
 
 	tcph, ok := sc.FindServiceTCP(dstSvc, dstAddr.Port())
 	if !ok {
+		// This VIP service may be fronting a Kubernetes Service of type
+		// LoadBalancer via the k8s-operator's ProxyGroup (see
+		// cmd/containerboot/ingressservices.go), in which case it's meant
+		// to be handled by a kernel-level nftables DNAT rule rather than an
+		// ipn.ServeConfig entry, and this function should never have been
+		// the one to claim the connection in the first place. If that DNAT
+		// rule loses its race with netstack claiming the connection here,
+		// fall back to proxying directly to the mapped ClusterIP instead
+		// of failing the connection outright.
+		if h := b.tcpHandlerForIngressServiceDNAT(dstSvc, dstAddr); h != nil {
+			return h
+		}
 		b.logf("The destination service doesn't have a TCP handler set.")
 		return nil
 	}
@@ -619,6 +632,62 @@ func (b *LocalBackend) tcpHandlerForVIPService(dstAddr, srcAddr netip.AddrPort) 
 		ForVIPService: dstSvc,
 		DestPort:      dport,
 	}, dstSvc)
+}
+
+// tcpHandlerForIngressServiceDNAT returns a TCP proxy handler for dstSvc if
+// TS_INGRESS_PROXIES_CONFIG_PATH points to an ingressservices.Configs file
+// (written by cmd/containerboot's ingress proxy, see
+// cmd/containerboot/ingressservices.go) containing a DNAT mapping for
+// dstAddr. It returns nil if the env var isn't set, the file can't be read,
+// or no mapping matches. This exists purely as a fallback for
+// tcpHandlerForVIPService -- see the comment at its call site.
+func (b *LocalBackend) tcpHandlerForIngressServiceDNAT(dstSvc tailcfg.ServiceName, dstAddr netip.AddrPort) func(net.Conn) error {
+	cfgPath := os.Getenv("TS_INGRESS_PROXIES_CONFIG_PATH")
+	if cfgPath == "" {
+		return nil
+	}
+	j, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return nil
+	}
+	var cfgs ingressservices.Configs
+	if err := json.Unmarshal(j, &cfgs); err != nil {
+		b.logf("tcpHandlerForIngressServiceDNAT: parsing %s: %v", cfgPath, err)
+		return nil
+	}
+	cfg := cfgs.GetConfig(dstSvc.String())
+	if cfg == nil {
+		return nil
+	}
+	var clusterIP netip.Addr
+	switch {
+	case cfg.IPv4Mapping != nil && cfg.IPv4Mapping.TailscaleServiceIP == dstAddr.Addr():
+		clusterIP = cfg.IPv4Mapping.ClusterIP
+	case cfg.IPv6Mapping != nil && cfg.IPv6Mapping.TailscaleServiceIP == dstAddr.Addr():
+		clusterIP = cfg.IPv6Mapping.ClusterIP
+	default:
+		return nil
+	}
+	target := netip.AddrPortFrom(clusterIP, dstAddr.Port())
+	return func(c net.Conn) error {
+		defer c.Close()
+		back, err := net.Dial("tcp", target.String())
+		if err != nil {
+			b.logf("tcpHandlerForIngressServiceDNAT: dial %v: %v", target, err)
+			return err
+		}
+		defer back.Close()
+		errc := make(chan error, 2)
+		go func() {
+			_, err := io.Copy(back, c)
+			errc <- err
+		}()
+		go func() {
+			_, err := io.Copy(c, back)
+			errc <- err
+		}()
+		return <-errc
+	}
 }
 
 // tcpHandlerForServe returns a handler for a TCP connection to be served via
