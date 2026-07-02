@@ -39,5 +39,5 @@ jobs:
         env:
           REPO: ghcr.io/${{ github.repository_owner }}/tailscale
           TAGS: ${{ github.event.inputs.tag }}
-          PLATFORM: linux/amd64
+          GOARCH: amd64
         run: make publishdevimage
